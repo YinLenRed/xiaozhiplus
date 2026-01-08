@@ -1,0 +1,448 @@
+import os
+import re
+import queue
+import uuid
+import asyncio
+import threading
+from core.utils import p3
+from datetime import datetime
+from core.utils import textUtils
+from abc import ABC, abstractmethod
+from config.logger import setup_logging
+from core.utils.util import audio_to_data, audio_bytes_to_data
+from core.utils.tts import MarkdownCleaner
+from core.utils.output_counter import add_device_output
+from core.handle.reportHandle import enqueue_tts_report
+from core.handle.sendAudioHandle import sendAudioMessage
+from core.providers.tts.dto.dto import (
+    TTSMessageDTO,
+    SentenceType,
+    ContentType,
+    InterfaceType,
+)
+
+import traceback
+
+TAG = __name__
+logger = setup_logging()
+
+
+class TTSProviderBase(ABC):
+    def __init__(self, config, delete_audio_file):
+        self.interface_type = InterfaceType.NON_STREAM
+        self.conn = None
+        self.tts_timeout = 10
+        self.delete_audio_file = delete_audio_file
+        self.audio_file_type = "wav"
+        self.output_file = config.get("output_dir", "tmp/")
+        self.tts_text_queue = queue.Queue()
+        self.tts_audio_queue = queue.Queue()
+        self.tts_audio_first_sentence = True
+        self.before_stop_play_files = []
+
+        self.tts_text_buff = []
+        self.punctuations = (
+            "。",
+            "？",
+            "?",
+            "！",
+            "!",
+            "；",
+            ";",
+            "：",
+            "~",
+        )
+        self.first_sentence_punctuations = (
+            "，",
+            "～",
+            "~",
+            "、",
+            ",",
+            "。",
+            "？",
+            "?",
+            "！",
+            "!",
+            "；",
+            ";",
+            "：",
+        )
+        self.tts_stop_request = False
+        self.processed_chars = 0
+        self.is_first_sentence = True
+
+    def generate_filename(self, extension=".wav"):
+        return os.path.join(
+            self.output_file,
+            f"tts-{datetime.now().date()}@{uuid.uuid4().hex}{extension}",
+        )
+
+    def to_tts(self, text):
+        text = MarkdownCleaner.clean_markdown(text)
+        max_repeat_time = 5
+        if self.delete_audio_file:
+            # 需要删除文件的直接转为音频数据
+            while max_repeat_time > 0:
+                try:
+                    audio_bytes = asyncio.run(self.text_to_speak(text, None))
+                    if audio_bytes:
+                        audio_datas, _ = audio_bytes_to_data(
+                            audio_bytes, file_type=self.audio_file_type, is_opus=True
+                        )
+                        return audio_datas
+                    else:
+                        max_repeat_time -= 1
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(
+                        f"语音生成失败{5 - max_repeat_time + 1}次: {text}，错误: {e}"
+                    )
+                    max_repeat_time -= 1
+            if max_repeat_time > 0:
+                logger.bind(tag=TAG).info(
+                    f"语音生成成功: {text}，重试{5 - max_repeat_time}次"
+                )
+            else:
+                logger.bind(tag=TAG).error(
+                    f"语音生成失败: {text}，请检查网络或服务是否正常"
+                )
+            return None
+        else:
+            tmp_file = self.generate_filename()
+            try:
+                while not os.path.exists(tmp_file) and max_repeat_time > 0:
+                    try:
+                        asyncio.run(self.text_to_speak(text, tmp_file))
+                    except Exception as e:
+                        logger.bind(tag=TAG).warning(
+                            f"语音生成失败{5 - max_repeat_time + 1}次: {text}，错误: {e}"
+                        )
+                        # 未执行成功，删除文件
+                        if os.path.exists(tmp_file):
+                            os.remove(tmp_file)
+                        max_repeat_time -= 1
+
+                if max_repeat_time > 0:
+                    logger.bind(tag=TAG).info(
+                        f"语音生成成功: {text}:{tmp_file}，重试{5 - max_repeat_time}次"
+                    )
+                else:
+                    logger.bind(tag=TAG).error(
+                        f"语音生成失败: {text}，请检查网络或服务是否正常"
+                    )
+
+                return tmp_file
+            except Exception as e:
+                logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
+                return None
+
+    @abstractmethod
+    async def text_to_speak(self, text, output_file):
+        pass
+
+    def audio_to_pcm_data(self, audio_file_path):
+        """音频文件转换为PCM编码"""
+        return audio_to_data(audio_file_path, is_opus=False)
+
+    def audio_to_opus_data(self, audio_file_path):
+        """音频文件转换为Opus编码"""
+        return audio_to_data(audio_file_path, is_opus=True)
+
+    def _remove_emojis(self, text):
+        """移除文本中的表情包，保留普通文字"""
+        if not text:
+            return text
+            
+        # 🔧 全面的表情包过滤：覆盖所有常见表情符号范围
+        import re
+        
+        # 扩展表情包范围，包含更多表情符号
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # 基础表情符号
+            "\U0001F300-\U0001F5FF"  # 杂项符号和象形文字  
+            "\U0001F680-\U0001F6FF"  # 交通和地图符号
+            "\U0001F1E0-\U0001F1FF"  # 国旗符号
+            "\U00002600-\U000027BF"  # 杂项符号
+            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
+            "\U0001FA70-\U0001FAFF"  # 扩展符号和象形文字A
+            "\U00002700-\U000027BF"  # 装饰符号
+            "\U0001F018-\U0001F270"  # 控制图片符号
+            "]",
+            flags=re.UNICODE
+        )
+        
+        # 移除表情包
+        cleaned_text = emoji_pattern.sub('', text)
+        
+        # 移除多余的空格
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        
+        return cleaned_text
+
+    def tts_one_sentence(
+        self,
+        conn,
+        content_type,
+        content_detail=None,
+        content_file=None,
+        sentence_id=None,
+    ):
+        """发送一句话"""
+        # 🛠️ 关键修复：检查并修复可能的异常状态
+        if not sentence_id and hasattr(conn, 'client_abort') and conn.client_abort:
+            # 如果是新会话且处于abort状态，重置状态
+            conn.client_abort = False
+            conn.logger.bind(tag="TTS").info("🔄 检测到abort状态，重置为正常状态以开始新TTS")
+        
+        if not sentence_id:
+            if conn.sentence_id:
+                sentence_id = conn.sentence_id
+            else:
+                sentence_id = str(uuid.uuid4().hex)
+                conn.sentence_id = sentence_id
+        
+        # 🔧 过滤表情包，确保TTS能正常处理文本
+        if content_detail:
+            original_text = content_detail
+            content_detail = self._remove_emojis(content_detail)
+            if original_text != content_detail:
+                conn.logger.bind(tag="TTS").info(f"🚫 移除表情包: '{original_text}' → '{content_detail}'")
+        
+        # 🔧 检查过滤后是否还有有效文本
+        if not content_detail or not content_detail.strip():
+            conn.logger.bind(tag="TTS").warning(f"⚠️ 过滤后文本为空，跳过TTS处理")
+            return
+        
+        # 对于单句的文本，进行分段处理
+        segments = re.split(r"([。！？!?；;\n])", content_detail)
+        for seg in segments:
+            # 🔧 跳过空字符串和只有空格的片段
+            if seg and seg.strip():
+                self.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=sentence_id,
+                        sentence_type=SentenceType.MIDDLE,
+                        content_type=content_type,
+                        content_detail=seg,
+                        content_file=content_file,
+                    )
+                )
+
+    async def open_audio_channels(self, conn):
+        self.conn = conn
+        self.tts_timeout = conn.config.get("tts_timeout", 10)
+        # tts 消化线程
+        self.tts_priority_thread = threading.Thread(
+            target=self.tts_text_priority_thread, daemon=True
+        )
+        self.tts_priority_thread.start()
+
+        # 音频播放 消化线程
+        self.audio_play_priority_thread = threading.Thread(
+            target=self._audio_play_priority_thread, daemon=True
+        )
+        self.audio_play_priority_thread.start()
+
+    # 这里默认是非流式的处理方式
+    # 流式处理方式请在子类中重写
+    def tts_text_priority_thread(self):
+        while not self.conn.stop_event.is_set():
+            try:
+                message = self.tts_text_queue.get(timeout=1)
+                if message.sentence_type == SentenceType.FIRST:
+                    self.conn.client_abort = False
+                if self.conn.client_abort:
+                    logger.bind(tag=TAG).info("收到打断信息，终止TTS文本处理线程")
+                    continue
+                if message.sentence_type == SentenceType.FIRST:
+                    # 初始化参数
+                    self.tts_stop_request = False
+                    self.processed_chars = 0
+                    self.tts_text_buff = []
+                    self.is_first_sentence = True
+                    self.tts_audio_first_sentence = True
+                elif ContentType.TEXT == message.content_type:
+                    self.tts_text_buff.append(message.content_detail)
+                    segment_text = self._get_segment_text()
+                    if segment_text:
+                        if self.delete_audio_file:
+                            audio_datas = self.to_tts(segment_text)
+                            if audio_datas:
+                                self.tts_audio_queue.put(
+                                    (message.sentence_type, audio_datas, segment_text)
+                                )
+                        else:
+                            tts_file = self.to_tts(segment_text)
+                            if tts_file:
+                                audio_datas = self._process_audio_file(tts_file)
+                                self.tts_audio_queue.put(
+                                    (message.sentence_type, audio_datas, segment_text)
+                                )
+                elif ContentType.FILE == message.content_type:
+                    self._process_remaining_text()
+                    tts_file = message.content_file
+                    if tts_file and os.path.exists(tts_file):
+                        audio_datas = self._process_audio_file(tts_file)
+                        self.tts_audio_queue.put(
+                            (message.sentence_type, audio_datas, message.content_detail)
+                        )
+
+                if message.sentence_type == SentenceType.LAST:
+                    self._process_remaining_text()
+                    self.tts_audio_queue.put(
+                        (message.sentence_type, [], message.content_detail)
+                    )
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.bind(tag=TAG).error(
+                    f"处理TTS文本失败: {str(e)}, 类型: {type(e).__name__}, 堆栈: {traceback.format_exc()}"
+                )
+                continue
+
+    def _audio_play_priority_thread(self):
+        while not self.conn.stop_event.is_set():
+            text = None
+            try:
+                try:
+                    sentence_type, audio_datas, text = self.tts_audio_queue.get(
+                        timeout=1
+                    )
+                    # 🔍 调试：检查从队列取出的数据
+                    logger.bind(tag=TAG).info(f"🔍 从队列取出数据: sentence_type={sentence_type}, text='{text}'")
+                    if audio_datas is None:
+                        logger.bind(tag=TAG).error(f"❌ 队列中的音频数据为None")
+                    elif len(audio_datas) == 0:
+                        logger.bind(tag=TAG).error(f"❌ 队列中的音频数据为空数组")
+                    else:
+                        logger.bind(tag=TAG).info(f"✅ 队列中音频数据正常: {len(audio_datas)}帧")
+                except queue.Empty:
+                    if self.conn.stop_event.is_set():
+                        break
+                    continue
+                
+                # 🔍 调试：检查传递给sendAudioMessage的数据
+                logger.bind(tag=TAG).info(f"🔍 准备调用sendAudioMessage: sentence_type={sentence_type}, audio_datas类型={type(audio_datas)}, 长度={len(audio_datas) if audio_datas else 'None'}")
+                
+                future = asyncio.run_coroutine_threadsafe(
+                    sendAudioMessage(self.conn, sentence_type, audio_datas, text),
+                    self.conn.loop,
+                )
+                future.result()
+                if self.conn.max_output_size > 0 and text:
+                    add_device_output(self.conn.headers.get("device-id"), len(text))
+                enqueue_tts_report(self.conn, text, audio_datas)
+            except Exception as e:
+                logger.bind(tag=TAG).error(
+                    f"audio_play_priority priority_thread: {text} {e}"
+                )
+
+    async def start_session(self, session_id):
+        pass
+
+    async def finish_session(self, session_id):
+        pass
+
+    async def close(self):
+        """资源清理方法"""
+        if hasattr(self, "ws") and self.ws:
+            await self.ws.close()
+
+    def _get_segment_text(self):
+        # 合并当前全部文本并处理未分割部分
+        full_text = "".join(self.tts_text_buff)
+        current_text = full_text[self.processed_chars :]  # 从未处理的位置开始
+        last_punct_pos = -1
+
+        # 根据是否是第一句话选择不同的标点符号集合
+        punctuations_to_use = (
+            self.first_sentence_punctuations
+            if self.is_first_sentence
+            else self.punctuations
+        )
+
+        for punct in punctuations_to_use:
+            pos = current_text.rfind(punct)
+            if (pos != -1 and last_punct_pos == -1) or (
+                pos != -1 and pos < last_punct_pos
+            ):
+                last_punct_pos = pos
+
+        if last_punct_pos != -1:
+            segment_text_raw = current_text[: last_punct_pos + 1]
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(
+                segment_text_raw
+            )
+            self.processed_chars += len(segment_text_raw)  # 更新已处理字符位置
+
+            # 如果是第一句话，在找到第一个逗号后，将标志设置为False
+            if self.is_first_sentence:
+                self.is_first_sentence = False
+
+            return segment_text
+        elif self.tts_stop_request and current_text:
+            segment_text = current_text
+            self.is_first_sentence = True  # 重置标志
+            return segment_text
+        else:
+            return None
+
+    def _process_audio_file(self, tts_file):
+        """处理音频文件并转换为指定格式
+
+        Args:
+            tts_file: 音频文件路径
+            content_detail: 内容详情
+
+        Returns:
+            tuple: (sentence_type, audio_datas, content_detail)
+        """
+        if tts_file.endswith(".p3"):
+            audio_datas, _ = p3.decode_opus_from_file(tts_file)
+        elif self.conn.audio_format == "pcm":
+            audio_datas, _ = self.audio_to_pcm_data(tts_file)
+        else:
+            audio_datas, _ = self.audio_to_opus_data(tts_file)
+
+        if (
+            self.delete_audio_file
+            and tts_file is not None
+            and os.path.exists(tts_file)
+            and tts_file.startswith(self.output_file)
+        ):
+            os.remove(tts_file)
+        return audio_datas
+
+    def _process_before_stop_play_files(self):
+        for audio_datas, text in self.before_stop_play_files:
+            self.tts_audio_queue.put((SentenceType.MIDDLE, audio_datas, text))
+        self.before_stop_play_files.clear()
+        self.tts_audio_queue.put((SentenceType.LAST, [], None))
+
+    def _process_remaining_text(self):
+        """处理剩余的文本并生成语音
+
+        Returns:
+            bool: 是否成功处理了文本
+        """
+        full_text = "".join(self.tts_text_buff)
+        remaining_text = full_text[self.processed_chars :]
+        if remaining_text:
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
+            if segment_text:
+                if self.delete_audio_file:
+                    audio_datas = self.to_tts(segment_text)
+                    if audio_datas:
+                        self.tts_audio_queue.put(
+                            (SentenceType.MIDDLE, audio_datas, segment_text)
+                        )
+                else:
+                    tts_file = self.to_tts(segment_text)
+                    audio_datas = self._process_audio_file(tts_file)
+                    self.tts_audio_queue.put(
+                        (SentenceType.MIDDLE, audio_datas, segment_text)
+                    )
+                self.processed_chars += len(full_text)
+                return True
+        return False
